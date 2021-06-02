@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+# Created by: Magyari.endre@combridge.ro
+
+import json
+import requests
+import pprint
+import sys
+import time
+import re
+import syslog
+from datetime import datetime
+import logging
+import logging.handlers
+from requests.exceptions import HTTPError
+import smtplib, ssl
+SSL_VERT_VERIFY = False
+
+def getCsoToken (baseURL, username, password, project):
+        headers2 = {"Content-Type":"application/json"}
+        data2 = '''{
+          "auth": {
+            "identity": {
+             "methods": [ "password" ],
+             "password": {
+            "user": {
+             "domain": {
+              "id": "default"
+           },
+             "name": "__USERNAME__",
+             "password": "__PASSWORD__"
+            }
+          }
+         },
+         "scope": {
+          "project": {
+          "domain": {
+           "id": "default"
+         },
+         "name": "__PROJECT__"
+         }
+         }
+         }
+        }'''
+
+        data2 = data2.replace("__USERNAME__",username)
+        data2 = data2.replace("__PASSWORD__",password)
+        data2 = data2.replace("__PROJECT__",project)
+        fullurl = baseURL + "/v3/auth/tokens"
+
+
+        try:
+
+                response = requests.post(fullurl, data=data2,headers=headers2, verify = SSL_VERT_VERIFY)
+                response.raise_for_status()
+                token = response.headers["X-Subject-Token"]
+                return token
+
+        except HTTPError as http_err:
+                print(f'HTTP error occurred: {http_err}')  # Python 3.6
+        except Exception as err:
+                print(f'Other error occurred: {err}')  # Python 3.6
+
+
+
+def hide_emails(ret):
+	if ret != None and type(ret) == str and ret != '':
+		return re.sub('[a-zA-Z0-9.]*@', 'xxxxxx@', ret)
+	elif type(ret) == list:
+		i = 0
+		for index in ret:
+			ret[i] = hide_emails(ret[i])
+			i = i + 1
+
+	elif type(ret) == dict:
+		for key in ret:
+			ret[key] = hide_emails(ret[key])
+	return ret
+
+def count_logins(data):
+	success_items = 0
+	unsuccess_items = 0
+	
+	details = data["output"]["details"]
+	for item in details:
+		if item["service_name"]=="IAMSVC-NOAUTH":
+			if item["status"] == "success":
+				success_items += 1
+			else:
+				unsuccess_items += 1
+	return success_items, unsuccess_items
+	
+def itemof(data, key):
+	return data[key] if key in data.keys() else "UNKNOWN"
+
+def message(data):
+	syslog_message="CSO UTC timestamp: {}, Status: {}, Scope: {}, Objecttype: {}, Task: {}, ServiceName {}, UserName {}, UserIP {}, UserRole {}, Message {} (SystemRef: {})"
+	timestamp = data["timestamp"]/1000
+	return syslog_message.format( datetime.utcfromtimestamp(timestamp), itemof(data, "status"), data["fq_name"][1], itemof(data, "object_type"),itemof(data,"task_name"),itemof(data,"service_name"),itemof(data,"user_name"), itemof(data,"user_ip"), data["id_perms"]["permissions"]["group"], itemof(data,"message"), itemof(data,"display_name"))
+
+	
+
+argv = sys.argv
+usage = '''
+Usage:
+
+AuditLog command ContrailURL scope username password  [how many 12 hours back from now] 
+
+- command, either authcount or log. Authcount retrieves the number of successfull/unsuccessfull authorisations while log returns the full log. 
+- ContrailURL, like https://contrail-juniper.net
+- scope: Tenant or OpCo
+- [days] - retrieving the logs for a number of 12h-s backwards starting from now, default is 1
+- [param]
+		in case command is log: hostname for remote syslog. If not provided, logging stdout. (Note: use /dev/log for local logging)
+		in case command is authcount: threshold for failed logins that triggers the email sending. Default is 5.
+
+'''
+if len(argv) < 6:
+        print (usage)
+        exit(-1)
+
+CSO = argv[2]
+password=argv[5]
+username=argv[4]
+scope=argv[3]
+command = argv[1]
+
+token = getCsoToken(CSO,username,password,scope)
+headers = {"Content-Type":"application/json", "x-auth-token":token}
+fullurl = CSO  + "/ems-central/export_audit_log"
+days = 1 if len(argv)<7 else int(argv[6])
+
+#setup logging 
+logger = None
+if command == "log" and len(argv)>=8:
+	logger = logging.getLogger()
+	syslog_handler = logging.handlers.SysLogHandler(argv[7] if argv[7][0]=='/' else (argv[7],514))
+	logger.addHandler(syslog_handler)
+
+#setup mail
+port = 465  # For SSL
+smtp_server = "cso-mail.telekom.net"
+sender_email = "audit@cso-mail.telekom.net"  # Enter your address
+receiver_email = "tech_dev@combridge.ro"  # Enter receiver address
+password = "(.O7yQgsQR*?"
+
+	
+#setup CSO payload
+audit = {}
+audit["input"] = {}
+audit["input"]["to_timestamp"] = int(time.time()*1000)
+audit["input"]["from_timestamp"] =  int((time.time()-days*12*3600)*1000)
+
+try:
+	response = requests.post(fullurl, data = json.dumps(audit),headers=headers,verify = SSL_VERT_VERIFY)
+	response.raise_for_status()
+	data  = response.json()
+	sanitizied_data = hide_emails(data)
+
+	if command == "log":
+		#print (json.dumps(sanitizied_data,indent=4))
+		for data in sanitizied_data["output"]["details"]:
+			if logger != None:
+				logger.critical(message(data))
+			else:
+				print (message(data))
+
+	elif command == "authcount":
+		success_items, unsuccess_items = count_logins(data)
+		threshold = 5 if (len(argv)< 8) else int(argv[7])
+		if unsuccess_items >= threshold:
+			context = ssl.create_default_context()
+			mail_message = "Subject: CSO Failed logins detected \n\n Successfull attempts: {} \n Unsuccesfull attempts: {} \n Threshold: {}\n\n Audited period: {} - {}\n\n, Relevant lines: ".format(success_items, unsuccess_items, threshold, datetime.utcfromtimestamp(audit["input"]["from_timestamp"]/1000), datetime.utcfromtimestamp(audit["input"]["to_timestamp"]/1000) )
+
+			for item in sanitizied_data["output"]["details"]:
+				if item["service_name"]=="IAMSVC-NOAUTH":
+					if item["status"] != "success":
+						mail_message = mail_message + "\n" + message(item)
+
+			with smtplib.SMTP_SSL(smtp_server, port, context=context) as server:
+				server.login(sender_email, password)
+				server.sendmail(sender_email, receiver_email, mail_message)
+	else: 
+		print (usage) 
+
+
+except HTTPError as http_err:
+	print(f'HTTP error occurred: {http_err}')  # Python 3.6
+except Exception as err:
+	print(f'Other error occurred: {err}')  # Python 3.6
+
+
+
+
